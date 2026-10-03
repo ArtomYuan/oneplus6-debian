@@ -36,6 +36,19 @@ fastboot erase dtbo
 - [6. 工具与文件清单](#6-工具与文件清单)
 - [7. 时间线与耗时](#7-时间线与耗时)
 - [8. 经验教训](#8-经验教训)
+- [9. TWRP 救援流程](#9-twrp-救援流程) ← **出问题时看这里**
+  - [9.1 开始刷机前必须先做这件事](#91-开始刷机前必须先做这件事)
+  - [9.2 为什么 TWRP 是最强的诊断工具](#92-为什么-twrp-是最强的诊断工具)
+  - [9.3 切换到 TWRP（救援）](#93-切换到-twrp救援)
+  - [9.4 救援场景 A：系统启动不了，先诊断](#94-救援场景-a系统启动不了先诊断)
+  - [9.5 救援场景 B：rootfs 损坏，重写](#95-救援场景-brootfs-损坏重写)
+  - [9.6 救援场景 C：从 Debian 回到 Android](#96-救援场景-c从-debian-回到-android)
+  - [9.7 场景 D：完全变砖，走 EDL](#97-场景-d完全变砖走-edl)
+  - [9.8 TWRP 使用注意事项（今天踩过的坑）](#98-twrp-使用注意事项今天踩过的坑)
+  - [9.9 救援命令速查](#99-救援命令速查)
+  - [9.10 救援决策树](#910-救援决策树)
+- [附录 A：常用命令速查](#附录-a常用命令速查)
+- [附录 B：参考链接](#附录-b参考链接)
 
 ---
 
@@ -710,6 +723,288 @@ fastboot --set-active=a    # 切换槽位并重置重试计数
 | 关键分区（abl/xbl/tz）| EDL + 擦除 | fastboot 会拒绝 |
 | 恢复变砖设备 | EDL | 唯一可用通道 |
 | 写入大镜像（rootfs）| `fastboot flash` | 原生批量传输，比 adb stdin 可靠 |
+
+---
+
+## 9. TWRP 救援流程
+
+> **本节是整篇文档里第二重要的部分**（第一是 `fastboot erase dtbo`）。
+>
+> 正是因为提前把 TWRP 放在 `boot_b`，才在设备「看起来彻底变砖」时证明了**硬件完好**，
+> 把排查方向从「硬件故障」扭转到「镜像配置」，最终刷机成功。
+
+### 9.1 开始刷机前必须先做这件事
+
+**在动主系统之前，先把 TWRP 放到另一个槽位。**
+
+```bash
+# TWRP for enchilada 3.7.0_11-0（匹配 Android 11 固件）
+# https://dl.twrp.me/enchilada/twrp-3.7.0_11-0-enchilada.img.html
+
+# A 槽放主系统，B 槽放 TWRP
+fastboot flash boot_a  <你的系统内核>.img
+fastboot flash boot_b  twrp-3.7.0_11-0-enchilada.img
+
+# 或者反过来 —— 关键是「永远有一个槽位是可用的恢复环境」
+```
+
+**代价：** 0（`boot_b` 本来也是空的）
+**收益：** 出任何问题时一条命令回到恢复模式
+
+### 9.2 为什么 TWRP 是最强的诊断工具
+
+TWRP 不只是「恢复模式」，它是一个**完整可用的 Linux 系统 + ADB shell**：
+
+| 能力 | 用途 |
+|---|---|
+| **挂载任意分区** | 检查 system/vendor 是否真的是有效文件系统 |
+| **直接读写块设备** | 读回分区验证写入是否真的成功 |
+| **ADB shell** | 完整的命令行环境（`dd`、`tar`、`busybox`）|
+| **刷入 .img** | 在设备上直接刷写任意分区，不依赖电脑 |
+| **格式化 / 清除** | 双清、格式化 userdata 为 ext4/f2fs |
+| **备份 / 恢复** | 备份分区到外置存储 |
+
+### 9.3 切换到 TWRP（救援）
+
+```bash
+# 1. 确认设备在 fastboot
+fastboot devices
+
+# 2. 切换到 B 槽（TWRP 所在槽位）
+fastboot --set-active=b
+# → Setting current slot to 'b'   OKAY
+
+# 3. 启动
+fastboot reboot
+```
+
+**等待约 60-90 秒**，然后：
+
+```bash
+# 4. 确认 TWRP 起来了
+lsusb | grep 2a70
+# → Bus 001 Device 064: ID 2a70:9012 OnePlus Technology (Shenzhen) Co., Ltd. ONEPLUS A6003
+
+adb devices
+# → 085ba2e7    recovery
+```
+
+**如果没进 TWRP**，说明 TWRP 也不完整，走 [9.7 完全变砖 → EDL](#97-场景-d完全变砖走-edl)。
+
+### 9.4 救援场景 A：系统启动不了，先诊断
+
+**别急着重刷。先用 TWRP 找出到底哪一环坏了。**
+
+#### 检查 1：内核分区里真的有内核吗
+
+```bash
+adb shell 'dd if=/dev/block/bootdevice/by-name/boot_a bs=1 count=8 2>/dev/null | hexdump -C'
+# 应看到: 41 4e 44 52 4f 49 44 21   = "ANDROID!"
+# 如果全是 00 → 内核分区是空的（写入静默失败）
+```
+
+#### 检查 2：system / vendor 是有效的文件系统吗
+
+```bash
+adb shell 'mkdir -p /mnt/systest'
+adb shell 'mount -t ext4 -o ro /dev/block/bootdevice/by-name/system_a /mnt/systest; echo rc=$?'
+# rc=0  → 挂载成功，文件系统有效
+# rc≠0  → 分区损坏或未写入
+
+adb shell 'ls /mnt/systest'
+adb shell 'cat /mnt/systest/build.prop | grep -E "ro.build.version"'
+# → ro.build.version.release=11
+# → ro.build.version.sdk=30
+```
+
+#### 检查 3：rootfs 的 UUID 对不对
+
+```bash
+adb shell 'dd if=/dev/block/bootdevice/by-name/userdata bs=1 skip=1024 count=1024 2>/dev/null' > /tmp/sb.bin
+xxd -s 104 -l 16 -p /tmp/sb.bin
+# 应与内核 cmdline 里的 mobile.root=UUID=... 一致
+```
+
+#### 检查 4：bootloader 是否真的尝试启动过
+
+```bash
+fastboot getvar slot-retry-count:a
+```
+
+| 变化 | 含义 |
+|---|---|
+| **7 → 6**（只减 1）| bootloader 尝试 1 次就放弃 → **镜像被拒绝**（校验/格式问题）|
+| **7 → 0**（反复减少）| bootloader 重试到耗尽 → **内核启动了但崩溃** |
+| **不变（仍是 7）** | 根本没尝试启动该槽位 → 槽位状态问题 |
+
+**这个差异决定排查方向：**
+
+- 「只减 1」→ 检查 boot 镜像头部、AVB 校验、dtbo
+- 「减到 0」→ 内核在跑，检查 rootfs / 驱动 / initramfs
+
+### 9.5 救援场景 B：rootfs 损坏，重写
+
+**症状：** 内核在跑（USB gadget 出现），但系统起不来，屏幕停在早期阶段。
+
+```bash
+# 方法 1：fastboot 直接写（推荐，最快）
+# 注意：需要设备在 fastboot 而不是 TWRP
+fastboot flash userdata rootfs.raw
+
+# 方法 2：在 TWRP 里用 ADB 流式写入
+# ⚠️ 注意 sudo 会吃掉 stdin，必须先用 sudo -n 验证凭据
+echo "$PW" | sudo -S -v          # 先验证 sudo
+sudo -n adb shell 'umount /data; umount /sdcard; sync
+                   dd of=/dev/block/bootdevice/by-name/userdata bs=4M conv=fsync' < rootfs.raw
+
+# 方法 3：TWRP 图形界面
+# Install → Install Image → 选择 rootfs.img → 选择 userdata 分区
+```
+
+**写完必须验证：**
+
+```bash
+adb shell 'dd if=/dev/block/bootdevice/by-name/userdata bs=1 skip=1024 count=1024 2>/dev/null' > /tmp/sb.bin
+xxd -s 56 -l 2 /tmp/sb.bin      # → 53ef  (ext4 魔数)
+xxd -s 104 -l 16 -p /tmp/sb.bin # → UUID，必须与 cmdline 匹配
+```
+
+**⚠️ TWRP 的 `/tmp` 只有 3.7 GB tmpfs** —— 6 GB 的 rootfs 不能 `adb push` 到那里。
+
+### 9.6 救援场景 C：从 Debian 回到 Android
+
+**这是最常被忽略但很重要的场景。** 装完 Linux 后想回 Android，需要**额外恢复 dtbo**（因为被擦除了）。
+
+```bash
+# ===== 第 1 步：恢复 dtbo（Linux 安装时被擦除的）=====
+fastboot flash dtbo_a dtbo.img
+fastboot flash dtbo_b dtbo.img
+
+# ===== 第 2 步：刷回原厂内核 =====
+fastboot flash boot_a boot.img
+fastboot flash boot_b boot.img
+
+# ===== 第 3 步：刷回系统分区 =====
+fastboot flash system_a system.img
+fastboot flash vendor_a vendor.img
+
+# ===== 第 4 步：恢复 AVB 签名（撤销 --disable-verity 的修改）=====
+fastboot flash vbmeta_a vbmeta.img
+fastboot flash vbmeta_b vbmeta.img
+
+# ===== 第 5 步：清空 userdata（Mobian 的 rootfs 会阻止 Android 启动）=====
+fastboot -w
+# 如果 fastboot -w 报错（make_f2fs 缺失），改用 EDL：
+#   edl --loader=$LOADER e userdata
+
+# ===== 第 6 步：激活 A 槽并启动 =====
+fastboot --set-active=a
+fastboot reboot
+```
+
+**⚠️ 第 5 步不能省。** Android 无法挂载一个装着 Debian 的 ext4 分区（UUID 不符、布局不同）。
+
+**⚠️ 如果 `fastboot flash` 报 `Flashing is not allowed for Critical Partitions`：**
+
+```bash
+fastboot flashing unlock_critical
+# 如果仍被拒绝（部分一加机型即使解锁也拒绝），改用 EDL：
+edl --loader=$LOADER e abL_a
+edl --loader=$LOADER w abl_a abl.img
+```
+
+### 9.7 场景 D：完全变砖，走 EDL
+
+**能进 EDL 就还有救。** 判据：`lsusb | grep 05c6:9008` 有输出。
+
+```bash
+# 1. 进入 EDL：拔线 → 长按电源 20 秒 → 按住 音量上+音量下 → 插线
+lsusb | grep 05c6:9008
+
+# 2. 必须用 HWID + PK_HASH 匹配的 loader（通用 loader 会静默失败）
+LOADER=~/Loaders/oneplus/0008b0e10051459b_dd7c5f2e53176bee_fhprg_op6t.bin
+
+# 3. 检查分区表（确认 loader 真的通了）
+edl --loader=$LOADER printgpt
+
+# 4. 刷写关键分区 —— 记住：先擦除！
+for P in xbl xbl_config abl tz hyp aop cmnlib cmnlib64 devcfg \
+         keymaster qupfw storsec bluetooth modem dsp; do
+    edl --loader=$LOADER e ${P}_a
+    edl --loader=$LOADER w ${P}_a ${P}.img
+done
+
+# 5. 读回验证（关键！）
+edl --loader=$LOADER r abl_a /tmp/verify.img
+cmp abl.img /tmp/verify.img && echo "✅ 写入成功" || echo "❌ 写入失败"
+```
+
+**EDL 是全国统一的最后手段**：只要 SoC 和存储没物理损坏，EDL 能写任何分区。
+
+### 9.8 TWRP 使用注意事项（今天踩过的坑）
+
+| 坑 | 说明 | 解决 |
+|---|---|---|
+| **`sudo -S` 吃掉 stdin** | `echo pw \| sudo -S adb ... < file` 时文件流被密码占用 | 先 `sudo -S -v` 验证，再用 `sudo -n` |
+| **`/tmp` 只有 3.7 GB** | tmpfs 在内存里 | 大文件用 fastboot 写，或分段处理 |
+| **TWRP 的 `dd` 大文件会失败** | 6 GB 流式写入报 `Bad address` | 改用 `fastboot flash` |
+| **TWRP 会让手机离开 fastboot** | 刷完重启后 `fastboot devices` 为空 | 刷机前先 `adb reboot bootloader` 并**确认返回非空** |
+| **fastboot 会卡在 `< waiting for any device >`** | 手机不在 fastboot 但命令已发出 | 加 `timeout`，先验证 `fastboot devices` 非空 |
+| **接口名不是固定的** | 我用 `enx00e04c...` 配错了网卡 | 从 `dmesg` 里找 `renamed from usb0` 的真实名字 |
+| **一加设备的 `fastboot boot` 可能不支持** | 报 `Failed to load/authenticate boot image` | 直接 `flash` 到分区再重启 |
+
+### 9.9 救援命令速查
+
+```bash
+# ===== 进入 / 切换 =====
+fastboot --set-active=b              # 切到 TWRP 槽位
+fastboot reboot                      # 启动
+
+# ===== TWRP 内（ADB）=====
+adb devices                          # → 085ba2e7  recovery
+adb shell getprop ro.twrp.version    # → 3.7.0_11-0
+adb shell getprop ro.boot.slot_suffix
+
+# ===== 分区操作 =====
+adb shell 'ls /dev/block/bootdevice/by-name/'                    # 列出全部分区
+adb shell 'mount -t ext4 -o ro /dev/block/bootdevice/by-name/system_a /mnt/x'
+adb shell 'umount /mnt/x'
+adb shell 'blockdev --getsize64 /dev/block/bootdevice/by-name/userdata'
+
+# ===== 读回验证（最重要的操作）=====
+adb shell 'dd if=/dev/block/bootdevice/by-name/boot_a bs=1 count=8 2>/dev/null' | xxd
+
+# ===== 在 TWRP 里刷镜像 =====
+adb push image.img /tmp/
+adb shell 'dd if=/tmp/image.img of=/dev/block/bootdevice/by-name/boot_a bs=4M'
+
+# ===== 从 TWRP 回到 fastboot =====
+adb reboot bootloader
+```
+
+### 9.10 救援决策树
+
+```
+手机不启动
+    │
+    ├─ 能进 fastboot (18d1:d00d)？
+    │      ├─ 能  → fastboot --set-active=b → 进 TWRP → 按 9.4 诊断
+    │      └─ 不能 ↓
+    │
+    ├─ 能进 EDL (05c6:9008)？
+    │      ├─ 能  → 用匹配的 loader 刷固件（9.7）
+    │      │        先刷 xbl/abl/tz，恢复 fastboot 能力
+    │      └─ 不能 ↓
+    │
+    └─ USB 上完全无反应？
+           ├─ 换数据线（必须是数据线，不是充电线）
+           ├─ 换 USB 口（试 USB 2.0）
+           ├─ 长按电源 20 秒后重试
+           ├─ 充电 30 分钟（可能是电池耗尽）
+           └─ 仍然无反应 → 硬件问题，需要专业维修
+```
+
+**今天的实际情况**就是走的左边第一条路径：`fastboot` → B 槽 TWRP → 诊断出硬件正常 → 修正镜像 → 成功。
 
 ---
 

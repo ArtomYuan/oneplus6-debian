@@ -2,6 +2,8 @@
 
 > **OnePlus 6 (enchilada) · OxygenOS 11.1.2.2 · Mobian 13.0 (Debian) · 2026-10-03**
 
+[English version](README.en.md)
+
 一个被刷成砖的一加6，如何在一次会话中从「完全无法开机」变成「运行 Debian 的紧凑型服务器」。
 
 本文记录完整过程、**踩过的每一个坑**，以及真正解决问题的关键步骤。
